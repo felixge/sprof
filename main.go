@@ -1,160 +1,249 @@
-// go-callvis: a tool to help visualize the call graph of a Go program.
-//
 package main
 
 import (
 	"flag"
 	"fmt"
-	"go/build"
-	"io/ioutil"
-	"log"
-	"net"
-	"net/http"
-	"net/url"
+	"go/types"
 	"os"
 	"time"
 
-	"github.com/pkg/browser"
-	"golang.org/x/tools/go/buildutil"
+	"github.com/google/pprof/profile"
+	"golang.org/x/tools/go/callgraph"
+	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/go/pointer"
+	"golang.org/x/tools/go/ssa"
+	"golang.org/x/tools/go/ssa/ssautil"
 )
 
-const Usage = `go-callvis: visualize call graph of a Go program.
+const Usage = `sprof: static profiling
 
 Usage:
 
-  go-callvis [flags] package
+  sprof <package> <pprof output file>
 
-  Package should be main package, otherwise -tests flag must be used.
-
-Flags:
+  Package should be a main package.
 
 `
 
-var (
-	focusFlag    = flag.String("focus", "main", "Focus specific package using name or import path.")
-	groupFlag    = flag.String("group", "pkg", "Grouping functions by packages and/or types [pkg, type] (separated by comma)")
-	limitFlag    = flag.String("limit", "", "Limit package paths to given prefixes (separated by comma)")
-	ignoreFlag   = flag.String("ignore", "", "Ignore package paths containing given prefixes (separated by comma)")
-	includeFlag  = flag.String("include", "", "Include package paths with given prefixes (separated by comma)")
-	nostdFlag    = flag.Bool("nostd", false, "Omit calls to/from packages in standard library.")
-	nointerFlag  = flag.Bool("nointer", false, "Omit calls to unexported functions.")
-	testFlag     = flag.Bool("tests", false, "Include test code.")
-	graphvizFlag = flag.Bool("graphviz", false, "Use Graphviz's dot program to render images.")
-	httpFlag     = flag.String("http", ":7878", "HTTP service address.")
-	skipBrowser  = flag.Bool("skipbrowser", false, "Skip opening browser.")
-	outputFile   = flag.String("file", "", "output filename - omit to use server mode")
-	outputFormat = flag.String("format", "svg", "output file format [svg | png | jpg | ...]")
-	cacheDir     = flag.String("cacheDir", "", "Enable caching to avoid unnecessary re-rendering, you can force rendering by adding 'refresh=true' to the URL query or emptying the cache directory")
-
-	debugFlag   = flag.Bool("debug", false, "Enable verbose log.")
-	versionFlag = flag.Bool("version", false, "Show version and exit.")
-)
-
-func init() {
-	flag.Var((*buildutil.TagsFlag)(&build.Default.BuildTags), "tags", buildutil.TagsFlagDoc)
-	// Graphviz options
-	flag.UintVar(&minlen, "minlen", 2, "Minimum edge length (for wider output).")
-	flag.Float64Var(&nodesep, "nodesep", 0.35, "Minimum space between two adjacent nodes in the same rank (for taller output).")
-}
-
-func logf(f string, a ...interface{}) {
-	if *debugFlag {
-		log.Printf(f, a...)
-	}
-}
-
-func parseHTTPAddr(addr string) string {
-	host, port, _ := net.SplitHostPort(addr)
-	if host == "" {
-		host = "localhost"
-	}
-	if port == "" {
-		port = "80"
-	}
-	u := url.URL{
-		Scheme: "http",
-		Host:   fmt.Sprintf("%s:%s", host, port),
-	}
-	return u.String()
-}
-
-func openBrowser(url string) {
-	time.Sleep(time.Millisecond * 100)
-	if err := browser.OpenURL(url); err != nil {
-		log.Printf("OpenURL error: %v", err)
-	}
-}
-
-func outputDot(fname string, outputFormat string) {
-	// get cmdline default for analysis
-	Analysis.OptsSetup()
-
-	if e := Analysis.ProcessListArgs(); e != nil {
-		log.Fatalf("%v\n", e)
-	}
-
-	output, err := Analysis.Render()
-	if err != nil {
-		log.Fatalf("%v\n", err)
-	}
-
-	log.Println("writing dot output..")
-
-	writeErr := ioutil.WriteFile(fmt.Sprintf("%s.gv", fname), output, 0755)
-	if writeErr != nil {
-		log.Fatalf("%v\n", writeErr)
-	}
-
-	log.Printf("converting dot to %s..\n", outputFormat)
-
-	_, err = dotToImage(fname, outputFormat, output)
-	if err != nil {
-		log.Fatalf("%v\n", err)
-	}
-}
-
 //noinspection GoUnhandledErrorResult
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	flag.Parse()
 
-	if *versionFlag {
-		fmt.Fprintln(os.Stderr, Version())
-		os.Exit(0)
-	}
-	if *debugFlag {
-		log.SetFlags(log.Lmicroseconds)
-	}
-
-	if flag.NArg() != 1 {
+	if flag.NArg() != 2 {
 		fmt.Fprintf(os.Stderr, Usage)
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
 
-	args     := flag.Args()
-	tests    := *testFlag
-	httpAddr := *httpFlag
-	urlAddr  := parseHTTPAddr(httpAddr)
-
-	Analysis = new(analysis)
-	if err := Analysis.DoAnalysis("", tests, args); err != nil {
-		log.Fatal(err)
+	fmt.Printf("analyzing source code ...\n")
+	cfg := &packages.Config{
+		Mode:  packages.LoadAllSyntax,
+		Tests: false,
+		Dir:   "",
+	}
+	initial, err := packages.Load(cfg, flag.Arg(0))
+	if err != nil {
+		return err
 	}
 
-	http.HandleFunc("/", handler)
-
-	if *outputFile == "" {
-		*outputFile = "output"
-		if !*skipBrowser {
-			go openBrowser(urlAddr)
-		}
-
-		log.Printf("http serving at %s", urlAddr)
-
-		if err := http.ListenAndServe(httpAddr, nil); err != nil {
-			log.Fatal(err)
-		}
-	} else {
-		outputDot(*outputFile, *outputFormat)
+	if packages.PrintErrors(initial) > 0 {
+		return fmt.Errorf("packages contain errors")
 	}
+
+	prog, pkgs := ssautil.AllPackages(initial, 0)
+	prog.Build()
+
+	mains, err := mainPackages(pkgs)
+	if err != nil {
+		return err
+	}
+
+	config := &pointer.Config{
+		Mains:          mains,
+		BuildCallGraph: true,
+	}
+
+	result, err := pointer.Analyze(config)
+	if err != nil {
+		return err
+	}
+
+	s := NewStack()
+	samples := []Sample{}
+	root := result.CallGraph.Root
+	fmt.Printf("performing static profiling...\n")
+	createStaticProfile(s, root, &samples)
+
+	fmt.Printf("writing pprof file ...\n")
+	functionID := uint64(1)
+	locationID := uint64(1)
+
+	p := &profile.Profile{
+		TimeNanos: time.Now().UnixNano(),
+	}
+	m := &profile.Mapping{ID: 1, HasFunctions: true}
+	p.Mapping = []*profile.Mapping{m}
+	p.SampleType = []*profile.ValueType{
+		{
+			Type: "calls",
+			Unit: "count",
+		},
+	}
+
+	for _, s := range samples {
+		sample := &profile.Sample{
+			Value: []int64{s.Count},
+		}
+
+		for i := len(s.Frames) - 1; i >= 0; i-- {
+			f := s.Frames[i]
+			function := &profile.Function{
+				ID:       functionID,
+				Name:     f.String(),
+				Filename: "main.go",
+			}
+			p.Function = append(p.Function, function)
+			functionID++
+
+			location := &profile.Location{
+				ID:      locationID,
+				Mapping: m,
+				Line: []profile.Line{{
+					Function: function,
+					Line:     int64(1),
+				}},
+			}
+			p.Location = append(p.Location, location)
+			locationID++
+
+			sample.Location = append(sample.Location, location)
+		}
+
+		p.Sample = append(p.Sample, sample)
+	}
+
+	outF, err := os.Create(flag.Arg(1))
+	if err != nil {
+		return err
+	}
+
+	if err := p.CheckValid(); err != nil {
+		return err
+	} else if err := p.Write(outF); err != nil {
+		return err
+	}
+	return nil
+}
+
+type Sample struct {
+	Frames []Func
+	Count  int64
+}
+
+func NewStack() *Stack {
+	return &Stack{seen: map[Func]struct{}{}}
+}
+
+type Stack struct {
+	stack []Func
+	seen  map[Func]struct{}
+}
+
+func (s *Stack) Add(fn Func) *Stack {
+	seen := map[Func]struct{}{fn: {}}
+	for fn := range s.seen {
+		seen[fn] = struct{}{}
+	}
+	stack := make([]Func, len(s.stack)+1)
+	copy(stack, s.stack)
+	stack[len(stack)-1] = fn
+	return &Stack{seen: seen, stack: stack}
+}
+
+func createStaticProfile(s *Stack, n *callgraph.Node, out *[]Sample) {
+	var count int64
+	if syn := n.Func.Syntax(); syn != nil {
+		l := syn.End() - syn.Pos()
+		count += int64(l) / int64(len(s.stack))
+	}
+	if len(n.Out) == 0 {
+		count += 1
+	}
+	if count > 0 {
+		*out = append(*out, Sample{Frames: s.stack, Count: count})
+	}
+
+	if len(s.stack) >= 8 {
+		return
+	}
+
+	for _, node := range n.Out {
+		fn := NewFunc(node.Callee)
+		if fn.Name == "init" && fn.Receiver == "" {
+			continue
+		}
+
+		// avoid recursion
+		if _, ok := s.seen[fn]; ok {
+			continue
+		}
+		ns := s.Add(fn)
+		createStaticProfile(ns, node.Callee, out)
+	}
+}
+
+type Func struct {
+	PkgPath  string
+	Receiver string
+	Name     string
+}
+
+func (f Func) String() string {
+	var s string
+	if f.PkgPath != "" {
+		s += f.PkgPath + "."
+	}
+	if f.Receiver != "" {
+		s += "(" + f.Receiver + ")."
+	}
+	s += f.Name
+	return s
+}
+
+func NewFunc(fn *callgraph.Node) (f Func) {
+	f.Name = fn.Func.Name()
+	if fn.Func.Pkg != nil {
+		f.PkgPath = fn.Func.Pkg.Pkg.Path()
+	}
+	if r := fn.Func.Signature.Recv(); r != nil {
+		switch t := r.Type().(type) {
+		case *types.Pointer:
+			f.Receiver += "*" + t.Elem().(*types.Named).Obj().Name()
+		case *types.Named:
+			f.Receiver += t.Obj().Name()
+		}
+	}
+	return
+}
+
+// mainPackages returns the main packages to analyze.
+// Each resulting package is named "main" and has a main function.
+func mainPackages(pkgs []*ssa.Package) ([]*ssa.Package, error) {
+	var mains []*ssa.Package
+	for _, p := range pkgs {
+		if p != nil && p.Pkg.Name() == "main" && p.Func("main") != nil {
+			mains = append(mains, p)
+		}
+	}
+	if len(mains) == 0 {
+		return nil, fmt.Errorf("no main packages")
+	}
+	return mains, nil
 }

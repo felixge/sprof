@@ -1,14 +1,17 @@
 package main
 
 import (
-	"github.com/ofabry/go-callvis/examples/main/mypkg"
+	"github.com/felixge/sprof/examples/main/mypkg"
 )
 
 func main() {
 	funcs()
 	var c calls
-	c.execution()
-	c.invocation()
+	if true {
+		c.execution()
+		c.invocation()
+	}
+	funcs()
 }
 
 func funcs() {
