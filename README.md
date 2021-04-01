@@ -33,4 +33,4 @@ sprof is the result of months of research and engineering and was first released
 
 ## Credits
 
-Credit goes to [github.com/ofabry/go-callvis](github.com/ofabry/go-callvis) for providing the foundation for sprof.
+Credit goes to [github.com/ofabry/go-callvis](https://github.com/ofabry/go-callvis) for providing the foundation for sprof.
