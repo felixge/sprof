@@ -1,3 +1,5 @@
+**April 1st:** Hold your turing awards, check the release date, and then enjoy this project for what it is : ).
+
 # sprof
 
 sprof is the next revolution in Go profiling. Instead of precariously measuring the execution of your program during runtime, sprof can find performance bottlenecks using only static analysis. Say good bye to irreproducible performance issues and high overhead profiling in production and welcome your new performance overlord, sprof.
